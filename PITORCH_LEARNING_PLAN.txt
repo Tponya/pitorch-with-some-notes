@@ -1,0 +1,233 @@
+PITORCH ANNOTATED LEARNING PLAN
+================================
+
+PURPOSE
+-------
+Create a beginner-friendly study edition of PiTorch without changing how the
+program behaves. Add concise guidance inside selected source files and keep
+longer explanations in docs/learning/.
+
+
+PROJECT LOCATIONS
+-----------------
+Original repository:
+https://github.com/masonwang025/pitorch
+
+Study fork:
+https://github.com/Tponya/pitorch-with-some-notes
+
+Working branch:
+Learning
+
+Local folder:
+C:\Users\qiton\Documents\QiTorch
+
+
+GOLDEN RULES
+------------
+[ ] Work only on the Learning branch.
+[ ] Annotate one subsystem at a time.
+[ ] Do not change program behavior while adding study notes.
+[ ] Avoid unrelated reformatting or renaming.
+[ ] Inspect the Git diff after every annotation pass.
+[ ] Do not commit or push until the annotations have been reviewed.
+[ ] Keep explanations useful without narrating every obvious line.
+[ ] Put long concept explanations in docs/learning/, not repeatedly in code.
+
+
+TASK ORGANIZATION
+-----------------
+Use the original Codex task as the roadmap and general-question task.
+
+Create one new Local task for each major subsystem. Do not create a separate
+task for every small file. Closely related files need shared context.
+
+Suggested task names:
+
+[ ] PiTorch 01 - Entry Point and Context
+[ ] PiTorch 02 - Text, Tokenizer, and Sampling
+[ ] PiTorch 03 - LLaMA Transformer Model
+[ ] PiTorch 04 - Core Mathematical Operations
+[ ] PiTorch 05 - GPU Acceleration
+[ ] PiTorch 06 - Communication Between Pis
+[ ] PiTorch 07 - Training
+
+Use only one editing task at a time when tasks share the Local checkout.
+Separate tasks can read the same files, but they do not automatically share
+conversation history.
+
+
+ANNOTATION LABELS
+-----------------
+C NOTE:        C language syntax or programming concept.
+HARDWARE NOTE: Raspberry Pi, memory, GPIO, UART, GPU, or bare-metal behavior.
+LLM NOTE:      Tokenization, transformer, sampling, inference, or training.
+FLOW:          Where execution or data came from and where it goes next.
+CAUTION:       A subtle point or likely misunderstanding.
+
+
+WHAT EACH ANNOTATED FILE SHOULD CONTAIN
+---------------------------------------
+1. A short file-level reading guide:
+   - why the file exists
+   - who calls it
+   - what it calls
+   - important inputs and outputs
+   - what file to read next
+
+2. Section comments before major stages.
+
+3. Function comments covering:
+   - purpose
+   - important parameters
+   - return value or side effects
+   - its place in the larger execution flow
+
+4. Line-level notes only for genuinely difficult syntax or concepts.
+
+
+REPEAT THIS CYCLE FOR EACH FILE GROUP
+-------------------------------------
+1. ORIENT
+   Skim comments, includes, constants, structures, and function names.
+
+2. MAP
+   Determine why the file exists, who calls it, and what it calls.
+
+3. TRACE
+   Follow one execution path without immediately opening every called function.
+
+4. ANNOTATE
+   Add file, section, function, and selected line-level explanations.
+
+5. REVIEW
+   Inspect the diff and confirm that no executable behavior changed.
+
+6. STUDY
+   Read the annotated file and ask focused questions about confusing sections.
+
+7. TEACH BACK
+   Explain the file in a few sentences, then ask Codex to correct the summary.
+
+8. COMMIT
+   After approval, make one focused commit for that file group.
+
+
+RECOMMENDED READING AND ANNOTATION ORDER
+----------------------------------------
+
+STAGE 1 - PROGRAM ENTRY AND CONTEXT
+[ ] examples/generate.c                 First pilot file
+[ ] pitorch/pt.h                        Public context API and data types
+[ ] pitorch/pt.c                        Initialization and high-level control
+
+STAGE 2 - TEXT GENERATION
+[ ] pitorch/text/README.md
+[ ] pitorch/text/pt_text.h
+[ ] pitorch/text/pt_text.c
+
+STAGE 3 - TRANSFORMER MODEL
+[ ] pitorch/model/README.md
+[ ] pitorch/model/llama2.h
+[ ] pitorch/model/llama2.c
+
+STAGE 4 - CORE OPERATIONS
+[ ] pitorch/ops/core/README.md
+[ ] pitorch/ops/core/pt_ops.h
+[ ] pitorch/ops/core/pt_ops.c
+[ ] pitorch/ops/core/pt_math.h and pt_math.c, as needed
+
+STAGE 5 - GPU PATH
+[ ] pitorch/ops/matvec/matvec.h
+[ ] pitorch/ops/matvec/matvec.c
+[ ] pitorch/runtime/arena.h and arena.c
+[ ] pitorch/runtime/gpu.h and gpu.c
+[ ] pitorch/kernels/matvec/matvec_tmu.qasm, only after the C wrapper
+
+STAGE 6 - COMMUNICATION BETWEEN PIS
+[ ] examples/generate-distributed.c
+[ ] pitorch/dist/pt_dist_pipeline.h and pt_dist_pipeline.c
+[ ] pitorch/dist/transport/pt_link.h
+[ ] pitorch/dist/transport/pt_link_gpio.h and pt_link_gpio.c
+[ ] pitorch/dist/protocol/pt_proto.h and pt_proto.c
+[ ] pitorch/model/pt_shard.h and pt_shard.c
+
+STAGE 7 - TRAINING (LAST)
+[ ] examples/train.c
+[ ] pitorch/train/pt_train.h and pt_train.c
+[ ] pitorch/train/pt_backward_ops.h and pt_backward_ops.c
+[ ] GPU GEMM files only when needed
+
+
+LEAVE THESE FOR LATER
+---------------------
+- Most of libpi/
+- Most files under dev/tests/
+- Profiler internals
+- Bootloader internals
+- Generated shader .c and .h files
+- Binary files such as .o, kernel.img, and fixup.dat
+- Most QASM until the surrounding C code is understood
+
+
+FIRST ANNOTATION TASK
+---------------------
+Task name:
+PiTorch 01 - Entry Point and Context
+
+Start with only examples/generate.c. Review the annotation style before moving
+to pitorch/pt.h and pitorch/pt.c.
+
+Copy-ready opening prompt:
+
+--- START PROMPT ---
+We are creating a beginner-oriented annotated study edition of PiTorch.
+
+Repository:
+https://github.com/Tponya/pitorch-with-some-notes
+
+Target branch: Learning
+
+My programming, embedded-systems, and LLM experience is limited. Explain
+technical terms at first use without assuming extensive background.
+
+Before editing, verify the Git remote, current branch, current HEAD commit, and
+that the working tree has no pre-existing changes other than this learning-plan
+file if it is still uncommitted. Preserve all existing user changes.
+
+For this pilot, annotate only examples/generate.c.
+
+Requirements:
+- Do not change program behavior.
+- Do not refactor or reformat the existing code.
+- Add a short file-level reading guide.
+- Add comments before major sections and important operations.
+- Explain unfamiliar C, bare-metal Raspberry Pi, and LLM concepts.
+- Use C NOTE, HARDWARE NOTE, LLM NOTE, FLOW, and CAUTION where helpful.
+- Explain why operations happen instead of merely restating the code.
+- Point toward called functions without fully explaining their implementations.
+- Do not narrate obvious statements line by line.
+
+After editing, inspect the diff, confirm whether every source-code change is
+comment-only, summarize the intended reading path, and stop for my review.
+Do not commit or push yet.
+--- END PROMPT ---
+
+
+AFTER THE PILOT IS APPROVED
+---------------------------
+[ ] Record the agreed annotation rules in a root AGENTS.md file.
+[ ] Create docs/learning/ for longer explanations and a glossary.
+[ ] Commit the approved generate.c annotation separately.
+[ ] Continue with pitorch/pt.h and pitorch/pt.c in the same task.
+[ ] Start a new task only when moving to the next subsystem.
+
+
+USEFUL GIT TERMS
+----------------
+Diff:    A display of changes between two versions of files.
+Commit:  A named checkpoint saved in the repository history.
+Push:    Upload local commits to the GitHub fork.
+HEAD:    The commit currently checked out in the local folder.
+Remote:  The GitHub repository connected to the local copy.
+
