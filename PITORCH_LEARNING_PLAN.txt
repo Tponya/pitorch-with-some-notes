@@ -117,7 +117,7 @@ RECOMMENDED READING AND ANNOTATION ORDER
 ----------------------------------------
 
 STAGE 1 - PROGRAM ENTRY AND CONTEXT
-[ ] examples/generate.c                 First pilot file
+[X ] examples/generate.c                 First pilot file
 [ ] pitorch/pt.h                        Public context API and data types
 [ ] pitorch/pt.c                        Initialization and high-level control
 
