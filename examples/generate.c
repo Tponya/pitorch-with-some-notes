@@ -118,20 +118,17 @@ void notmain(void) {
     mmu_init_and_enable();
 
     /*
-     * FLOW: Recover the tokenizer before model initialization reserves runtime
-     * state memory. The SD image is one combined file of raw bytes: configuration
-     * and model weights first, then tokenizer data. pt_pi_init() places reusable
-     * state buffers after the weights, where they may overlap the original
-     * tokenizer bytes. pt_load_tokenizer() therefore copies the needed tokenizer
-     * data into its own fixed, preallocated arrays first.
+     * FLOW: Load the tokenizer before setting up the model. Model setup uses
+     * some of the same memory, so loading the tokenizer later could be too late.
+     * pt_load_tokenizer() copies it to a safe place now.
      *
-     * LLM NOTE: A tokenizer maps prompt text to token IDs and generated token
-     * IDs back to text pieces. The model configuration supplies vocab_size,
-     * the number of distinct token IDs in its vocabulary.
+     * LLM NOTE: The tokenizer changes text into number IDs for the model, then
+     * changes generated IDs back into text. vocab_size is the number of IDs the
+     * model knows.
      *
-     * C NOTE: A struct groups related fields. The & operator passes a struct's
-     * address so the called loader can fill it; follow pt_load_config() and
-     * pt_load_tokenizer() later for their binary parsing details.
+     * C NOTE: tmp_cfg and tok are structs, which are variables that hold several
+     * related values. & means "the address of this variable"; it lets a function
+     * fill in that variable. Read the two loader functions later for details.
      */
     pt_config_t tmp_cfg;
     pt_load_config(&tmp_cfg, WEIGHT_ADDR);
