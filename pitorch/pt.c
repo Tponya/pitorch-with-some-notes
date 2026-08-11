@@ -203,10 +203,12 @@ void pt_pi_init(pt_context_t *ctx, void *weight_data,
      * at the wrong address. This is only a plausibility check, not complete
      * validation of every header value or byte in the file.
      *
-     * C NOTE: `(volatile int *)weight_data` says to treat the generic address
-     * as an address of an int; the leading * then reads the int stored there.
-     * volatile requires a real read from that RAM address. panic() prints the
-     * diagnostic and stops normal execution on this bare-metal path.
+     * C NOTE: weight_data is generic because its declared type is void *.
+     * `(volatile int *)weight_data` converts that same address to an address of
+     * an int; the leading * then reads the int stored there. volatile tells the
+     * compiler to perform this access as written rather than remove or reuse it;
+     * it does not bypass the CPU cache. It is a defensive precaution in this
+     * one-time check. panic() prints the diagnostic and reboots the bare-metal Pi.
      */
     /* validate weight data */
     int dim0 = *(volatile int *)weight_data;
