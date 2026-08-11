@@ -10,10 +10,10 @@
  * The main setup flow is:
  *
  *   model bytes already in RAM
- *       -> copy the small configuration and record weight addresses
+ *       -> copy seven configuration integers and record weight addresses
  *       -> reserve working memory
  *       -> select CPU or GPU-backed matrix calculations
- *       -> return a prepared pt_context_t to the caller
+ *       -> leave the caller's existing pt_context_t filled and ready to use
  *
  * Reading guide:
  *   1. Follow the Pi matrix-vector wrapper and simple scratch allocator.
@@ -65,11 +65,15 @@
 /* ── Pi globals for GPU matvec wrapper ──────────────────────── */
 
 /*
- * FLOW: The portable transformer asks for calculations through one common
- * pt_matvec_fn function shape. matvec_gpu() is an adapter: it has that expected
- * shape but forwards the work to the Pi-specific GPU routine. The common shape
- * has no QPU-count argument, so this file-private variable remembers the count
- * chosen during setup.
+ * FLOW: The same transformer code is used on the Pi and on a host computer;
+ * that is what "portable" means here. It needs a matrix-vector function that
+ * accepts W, x, y, out_dim, and in_dim and returns no value. This required list
+ * of input types and return type is called a function signature.
+ *
+ * matvec_gpu() is a wrapper: a small helper around another function. It matches
+ * the signature the transformer expects, prepares the temporary GPU workspace,
+ * and then calls the Pi-specific GPU routine. That signature has no place for
+ * a QPU count, so the shared variable below remembers the setup choice.
  *
  * C NOTE: static at file level makes a name private to this .c file while its
  * value lasts for the program's lifetime. This shared setting means the Pi path
@@ -85,8 +89,10 @@ static int g_num_qpus;
  *
  * HARDWARE NOTE: Resetting the arena rewinds its temporary allocation position
  * so this multiplication can reuse the workspace left by the previous one. It
- * does not erase the model weights. NULL says that this call is not supplying
- * a separate per-operation performance record.
+ * does not erase the model weights. The final argument could point to a perf_t
+ * record containing timing and GPU-cycle measurements. NULL is a special
+ * pointer value meaning "no object is supplied," so this call performs the
+ * calculation without saving that optional record.
  */
 static void matvec_gpu(const float *W, const float *x, float *y,
                        int out_dim, int in_dim) {
@@ -94,32 +100,39 @@ static void matvec_gpu(const float *W, const float *x, float *y,
     smatvec_tmu(W, x, y, out_dim, in_dim, g_num_qpus, NULL);
 }
 
-/* ── Pi bump allocator (base set dynamically in pt_pi_init) ── */
+/* ── Pi bump allocator (starting address calculated in pt_pi_init) ── */
 
 /*
  * HARDWARE NOTE: Bare-metal code has no operating system providing ordinary
- * malloc() here. This small "bump allocator" divides a predetermined ARM-memory
- * region. state_base is the region's first address; scratch_off records how
- * many bytes have already been handed out.
+ * malloc() here. This small "bump allocator" divides one ARM-memory region.
+ * A buffer is simply an area reserved for holding data. state_base is the first
+ * address available for these buffers; scratch_off is the number of bytes from
+ * that starting address that have already been assigned.
  *
  * This is different from the GPU arena above: scratch_alloc() provides
  * long-lived inference or training buffers, while the GPU arena is temporary
  * calculation workspace reset before each matrix-vector operation.
+ *
+ * All of these ARM buffers are created together and reused for as long as the
+ * model runs. Their contents are overwritten or cleared when needed, but their
+ * memory remains assigned to the model. Individual free operations would add
+ * bookkeeping that this fixed, same-lifetime layout does not need; setup can
+ * reuse the entire region at once by returning scratch_off to zero.
  */
 static unsigned state_base;
 static unsigned scratch_off;
 
 /*
- * FLOW: Return the next unused address, then advance the offset for the next
- * request. Allocation helpers in llama2.c and pt_train.c receive this function
- * as a callback—a function they are allowed to call—and use it to claim
- * consecutive pieces of the fixed region.
+ * FLOW: Allocation helpers in llama2.c and pt_train.c call this function when
+ * they need a buffer of a certain byte size. It gives them the next unused
+ * address, then moves scratch_off forward so the following buffer will begin
+ * after this one.
  *
  * C NOTE: void * is a generic address. `(bytes + 15u) & ~15u` rounds a size up
  * to a multiple of 16 bytes; this keeps each following address 16-byte aligned.
- * Alignment means the address is divisible by the chosen boundary. The `u`
- * marks an unsigned number. This allocator cannot free one piece individually;
- * setting scratch_off back to zero reuses the whole layout during setup.
+ * Alignment means the address is divisible by the chosen boundary. unsigned is
+ * an integer type that cannot represent negative values, which suits addresses,
+ * byte counts, and offsets. The `u` marks an unsigned number.
  *
  * CAUTION: This helper does not check its limit on each request. The setup
  * functions calculate the final required address and compare it with the Pi's
@@ -132,16 +145,24 @@ static void *scratch_alloc(unsigned bytes) {
 }
 
 /*
- * FLOW: Prepare the single-Pi context used by examples/generate.c. The caller
- * passes the address of its context with &ctx; this function clears that same
- * struct, prepares GPU support, interprets the model bytes, chooses a memory
- * layout, and fills the fields needed by later inference or training calls.
+ * FLOW: Prepare the single-Pi context used by examples/generate.c. Its
+ * notmain() function creates the actual ctx variable and supplies &ctx as this
+ * function's first argument. "Supplies" or "passes" means placing a value into
+ * a function call. &ctx is the address where that original struct lives; the
+ * ctx parameter below holds that address and can change the original fields.
+ * This function returns no value, but when it finishes, execution resumes in
+ * notmain() with that same struct filled and ready to use.
  *
- * weight_data points to a checkpoint—the model configuration and learned
- * weights—that the boot setup already placed in RAM. num_qpus chooses the GPU
+ * weight_data is not the model bytes themselves. It is a pointer containing the
+ * address of the first byte. At that address are the checkpoint's raw bytes:
+ * seven configuration integers followed by millions of learned weight values.
+ * The loader interprets them by treating agreed byte positions as particular
+ * integers or floating-point arrays.
+ *
+ * A memory layout is the plan assigning each range of RAM a purpose, such as
+ * model weights, inference state, or GPU workspace. num_qpus chooses the GPU
  * worker count. max_T == 0 requests inference state; a positive value also
- * reserves training data for that many token positions. arena_bytes controls
- * only the temporary GPU workspace.
+ * reserves training data. arena_bytes sizes the temporary GPU workspace.
  *
  * CAUTION: ctx stores pointers into weight_data rather than owning a copy, so
  * those model bytes must remain in place for as long as the context is used.
@@ -149,17 +170,23 @@ static void *scratch_alloc(unsigned bytes) {
 void pt_pi_init(pt_context_t *ctx, void *weight_data,
                 int num_qpus, int max_T, unsigned arena_bytes) {
     /*
-     * C NOTE: memset writes zero into every byte of the caller's context. This
-     * gives counters a zero start and pointer fields a null value; it does not
-     * clear the model weights. sizeof(*ctx) means "the size of the struct that
-     * ctx points to," not the smaller size of the address stored in ctx.
+     * C NOTE: `pt_context_t ctx;` in notmain() initially contains unspecified
+     * leftover bits. memset gives the struct a known starting condition by
+     * writing zero into all of it. Integer fields such as pos and max_T become
+     * zero. Pointer fields—fields meant to hold addresses—become null until the
+     * later setup assigns real addresses. This does not clear model weights,
+     * which live in the separate region reached through weight_data.
+     * sizeof(*ctx) means "the size of the struct at this address," not the
+     * smaller size of the address itself.
      */
     memset(ctx, 0, sizeof(*ctx));
 
     /*
-     * HARDWARE NOTE: Enable the QPUs, prepare performance-counter support, and
-     * request the one GPU-visible arena used by matvec_gpu(). perf_init() only
-     * prepares measurement support; it does not start a timed model operation.
+     * HARDWARE NOTE: Enable the QPUs and request the GPU-visible arena used by
+     * matvec_gpu(). A performance counter is a hardware measurement such as
+     * elapsed microseconds, executing cycles, idle cycles, or stalled cycles.
+     * perf_init() prepares those counters in case code requests a performance
+     * record later; it does not start measuring this setup code.
      */
     qpu_enable();
     perf_init();

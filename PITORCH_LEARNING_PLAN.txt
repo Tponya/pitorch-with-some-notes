@@ -33,6 +33,9 @@ GOLDEN RULES
 [ ] Do not commit or push until the annotations have been reviewed.
 [ ] Keep explanations useful without narrating every obvious line.
 [ ] Put long concept explanations in docs/learning/, not repeatedly in code.
+[ ] In chat explanations and external study notes, identify referenced code as
+    path:line (for example, path/to/file.c:123) so it is easy to locate. Keep
+    hard-coded line numbers out of inline source comments because edits move them.
 
 
 TASK ORGANIZATION
