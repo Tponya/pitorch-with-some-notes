@@ -1,8 +1,37 @@
+/*
+ * Text-layer implementation: translate a prompt into token IDs, choose new
+ * token IDs from model scores, and translate those IDs back into printed text.
+ * examples/generate.c prepares the tokenizer and sampler, then calls
+ * pt_generate() once for each prompt.
+ *
+ * FLOW:
+ *   prompt text -> pt_encode() -> prompt IDs -> pt_forward()
+ *       prefill: use the known next prompt ID and repeat
+ *       decode:  logits -> pt_sample() -> ID -> pt_decode() -> text/byte piece
+ *
+ * Reading guide:
+ *   1. Follow tokenizer loading into the fixed pools.
+ *   2. Read pt_decode(), then read pt_encode() at the level of its major steps.
+ *      The sorting helpers only make text-to-ID lookup faster.
+ *   3. Read pt_sample() for greedy, temperature, and top-p choices.
+ *   4. Finish with pt_generate(), which joins this layer to the transformer.
+ *
+ * The transformer's internal mathematics remains in model/llama2.c. The exact
+ * sorting algorithms and math primitives are signposts for later stages.
+ */
+
 #include <string.h>
 #include "pt_text.h"
 #include "pt_ops.h"
 #include "pt_math.h"
 
+/*
+ * C NOTE: The preprocessor selects one platform while the program is built.
+ * A bare-metal Pi gets its serial-output and timer functions from rpi.h. A host
+ * build reuses the same calls by making printk another name for printf. Its
+ * placeholder timer always returns zero, so generation timings are meaningful
+ * on the Pi but not in this compact host compatibility path.
+ */
 #ifdef __RPI__
 #include "rpi.h"
 #else
@@ -16,7 +45,23 @@ static inline uint32_t timer_get_usec(void) { return 0; }
 
 /* ── static pools (BSS, ~1.3 MB total) ──
  * ARM binary is ~25 KB at 0x8000. BSS extends to ~1.3 MB.
- * Nothing else lives between the binary and STATE_BASE (32 MB). */
+ * Nothing else lives between the binary and STATE_BASE (32 MB).
+ *
+ * HARDWARE NOTE: BSS is the part of the program image reserved for global and
+ * static variables that start as zero. These fixed arrays avoid malloc(), which
+ * the bare-metal Pi does not receive from an operating system, and they remain
+ * available for the program's entire run.
+ *
+ * TOKENIZER MAP:
+ *   token ID -> vocab_ptrs[id] -> null-terminated piece in vocab_pool
+ *   token ID -> scores_pool[id] (preference used only for BPE merging)
+ *   piece text -> sorted_pool -> original token ID
+ *
+ * C NOTE: `static` makes these names private to this source file. A
+ * pt_tokenizer_t points into these shared pools rather than owning separate
+ * arrays. MAX_VOCAB and vocab_pool are fixed capacities; this trusted-asset
+ * loader does not check that an incompatible tokenizer fits them.
+ */
 
 static char              vocab_pool[512 * 1024];
 static float             scores_pool[MAX_VOCAB];
@@ -27,12 +72,37 @@ static pt_token_index_t  sorted_pool[MAX_VOCAB];
  *  TOKENIZER
  * ═══════════════════════════════════════════════════════════════════ */
 
+/*
+ * FLOW: The combined generation image stores two binary payloads back to back:
+ *
+ *   [model checkpoint][tokenizer payload]
+ *
+ * Both are already in memory. pt_file_size() calculates the checkpoint span;
+ * converting combined_file to `const char *` makes addition advance by bytes,
+ * so tok_data lands at the first tokenizer byte. pt_tokenizer_init() then
+ * copies the needed tokenizer data into the safe static pools above.
+ */
 void pt_load_tokenizer(pt_tokenizer_t *t, const void *combined_file, int vocab_size) {
     unsigned model_bytes = pt_file_size(combined_file);
     const void *tok_data = (const char *)combined_file + model_bytes;
     pt_tokenizer_init(t, tok_data, vocab_size);
 }
 
+/*
+ * FLOW: Treat `data` as a cursor moving through this binary layout:
+ *
+ *   [maximum piece length: 4 bytes]
+ *   repeated vocab_size times:
+ *       [merge score: 4 bytes][piece length: 4 bytes][piece bytes]
+ *
+ * A binary payload is just bytes, with no C variable names or string-ending
+ * '\0' bytes. memcpy() reads each numeric value without assuming the cursor has
+ * the alignment required for an int or float. Producer and reader must still
+ * agree on their number sizes, floating-point format, and byte order.
+ *
+ * LLM NOTE: The stored score ranks possible BPE merges during encoding. It is
+ * unrelated to the model logits used later to predict the next token.
+ */
 void pt_tokenizer_init(pt_tokenizer_t *t, const void *data, int vocab_size) {
     const unsigned char *p = (const unsigned char *)data;
 
@@ -47,6 +117,7 @@ void pt_tokenizer_init(pt_tokenizer_t *t, const void *data, int vocab_size) {
     t->sorted_vocab     = sorted_pool;
     t->sorted_ready     = 0;
 
+    /* `pool` is the next unused character address in the shared text storage. */
     char *pool = vocab_pool;
 
     for (int i = 0; i < vocab_size; i++) {
@@ -59,6 +130,7 @@ void pt_tokenizer_init(pt_tokenizer_t *t, const void *data, int vocab_size) {
         memcpy(&len, p, 4);
         p += 4;
 
+        /* Copy the raw piece and add the terminator required by C strings. */
         memcpy(pool, p, len);
         pool[len] = '\0';      /* binary doesn't null-terminate */
         t->vocab[i] = pool;
@@ -71,6 +143,22 @@ void pt_tokenizer_init(pt_tokenizer_t *t, const void *data, int vocab_size) {
 
 static unsigned char byte_val_buf[2];
 
+/*
+ * LLM NOTE: This is detokenization—mapping one token ID back to one text piece.
+ * It is different from the model's longer "decode phase," which repeatedly
+ * predicts tokens. prev_token lets the tokenizer remove an artificial leading
+ * space when the previous ID was BOS (beginning of sequence).
+ *
+ * Some vocabulary entries spell a raw byte as `<0xHH>`, where HH contains two
+ * hexadecimal digits. The bare-metal runtime does not provide sscanf(), so the
+ * loop converts those digits manually. Ordinary pieces point into vocab_pool;
+ * a raw-byte result uses the shared two-byte buffer above. The caller borrows
+ * the returned pointer and should use it before another byte token overwrites
+ * that buffer.
+ *
+ * CAUTION: The caller must supply valid token IDs; this function does not check
+ * array bounds.
+ */
 const char *pt_decode(pt_tokenizer_t *t, int prev_token, int token) {
     char *piece = t->vocab[token];
 
@@ -99,6 +187,16 @@ const char *pt_decode(pt_tokenizer_t *t, int prev_token, int token) {
 
 /* ── sort + search for encode ── */
 
+/*
+ * FLOW: Decoding already has an ID and can use vocab[id] directly. Encoding
+ * starts with text and needs the reverse lookup. The original vocabulary cannot
+ * be rearranged because the model's token IDs must stay fixed, so ensure_sorted()
+ * builds a second list of {string, original ID} pairs on the first encode call.
+ * Shell sort orders that list once; str_lookup() then uses binary search, which
+ * repeatedly discards half of the remaining candidates. A return value of -1
+ * means the requested piece is absent. The sorting mechanics may be skimmed on
+ * this reading pass.
+ */
 static void shellsort_vocab(pt_token_index_t *arr, int n) {
     for (int gap = n / 2; gap > 0; gap /= 2)
         for (int i = gap; i < n; i++) {
@@ -136,6 +234,26 @@ static void ensure_sorted(pt_tokenizer_t *t) {
 
 /* ── encode (string → token ids) ── */
 
+/*
+ * FLOW: Convert text to model input in five stages:
+ *   1. Build the reverse vocabulary lookup if this is the first call.
+ *   2. Optionally add BOS and the tokenizer's initial-space convention.
+ *   3. Turn each UTF-8 character into an initial token, falling back to bytes.
+ *   4. Repeatedly merge adjacent pieces according to the best vocabulary score.
+ *   5. Optionally add EOS and report the final token count through n_tokens.
+ *
+ * LLM NOTE: BPE (byte-pair encoding) represents text using reusable subword
+ * pieces. It begins with small pieces, then replaces neighboring pairs with a
+ * larger vocabulary piece when possible. Tokenizer merge scores decide which
+ * available pair is merged first; they are not next-token probabilities.
+ *
+ * C NOTE: bos and eos are int values used as yes/no flags. `tokens` is an array
+ * owned by the caller, and `*n_tokens` changes the caller's count variable.
+ *
+ * CAUTION: This compact implementation trusts its project inputs. It receives
+ * no token-array capacity and does not validate malformed UTF-8 or whether a
+ * possible merged string fits merge_buf below.
+ */
 void pt_encode(pt_tokenizer_t *t, const char *text, int bos, int eos,
                int *tokens, int *n_tokens) {
     ensure_sorted(t);
@@ -151,7 +269,11 @@ void pt_encode(pt_tokenizer_t *t, const char *text, int bos, int eos,
             tokens[n++] = sp_id;
     }
 
-    /* initial encoding: one token per UTF-8 codepoint (or byte fallback) */
+    /*
+     * C NOTE: UTF-8 stores one Unicode code point in one to four bytes. The masks
+     * inspect the leading byte pattern to choose that byte count; c advances by
+     * the complete sequence rather than assuming every character is one byte.
+     */
     for (const char *c = text; *c; ) {
         int cplen = 1;
         if      ((*c & 0x80) == 0)    cplen = 1;
@@ -167,13 +289,19 @@ void pt_encode(pt_tokenizer_t *t, const char *text, int bos, int eos,
         if (id != -1) {
             tokens[n++] = id;
         } else {
+            /* IDs 0, 1, and 2 are reserved; this format starts byte IDs at 3. */
             for (int i = 0; i < cplen; i++)
                 tokens[n++] = (unsigned char)c[i] + 3;
         }
         c += cplen;
     }
 
-    /* iterative BPE merge */
+    /*
+     * LLM NOTE: Each pass tries every neighboring pair. If the concatenated
+     * text is itself a vocabulary piece, remember the candidate with the
+     * greatest merge score. Replacing that pair shortens the token list by one;
+     * the process stops only when no adjacent pair can be merged.
+     */
     char merge_buf[256];
     while (1) {
         float best_score = -1e10f;
@@ -206,6 +334,10 @@ void pt_encode(pt_tokenizer_t *t, const char *text, int bos, int eos,
  *  SAMPLER
  * ═══════════════════════════════════════════════════════════════════ */
 
+/*
+ * LLM NOTE: This xorshift generator supplies pseudo-random sampling values. The
+ * same seed reproduces the same sequence; it is not intended for security.
+ */
 static uint64_t rng_next(uint64_t *state) {
     uint64_t x = *state;
     x ^= x << 13;
@@ -221,6 +353,7 @@ static float rng_float(uint64_t *state) {
 
 void pt_sampler_init(pt_sampler_t *s, int vocab_size,
                      float temp, float topp, uint64_t seed) {
+    /* A zero xorshift state stays zero, so zero selects the fallback seed 42. */
     s->vocab_size  = vocab_size;
     s->temperature = temp;
     s->topp        = topp;
@@ -229,6 +362,10 @@ void pt_sampler_init(pt_sampler_t *s, int vocab_size,
 
 typedef struct { float prob; int index; } prob_index_t;
 
+/*
+ * Top-p sorting must keep each probability paired with its token ID. This fixed
+ * workspace avoids malloc(); the heap-sort mechanics may be skimmed for now.
+ */
 static prob_index_t pi_pool[MAX_VOCAB];
 
 static void sift_down(prob_index_t *a, int n, int i) {
@@ -250,6 +387,25 @@ static void heapsort_pi(prob_index_t *a, int n) {
     }
 }
 
+/*
+ * FLOW: Turn one raw score per vocabulary token into one selected token ID:
+ *
+ *   temperature == 0 -> return the highest-score ID directly
+ *   otherwise        -> scale logits -> softmax probabilities
+ *                    -> optionally keep a top-p group -> random choice
+ *
+ * LLM NOTE: Softmax converts arbitrary logits into nonnegative probabilities
+ * that total approximately 1. Dividing by a low positive temperature makes
+ * score differences more decisive; a higher temperature makes choices more
+ * varied. Top-p, or nucleus sampling, keeps the most probable tokens until
+ * their combined probability passes p, then samples within that group. A zero
+ * temperature returns argmax before this probability path. With nonzero
+ * temperature, topp values outside 0 < topp < 1 use the full distribution.
+ *
+ * C NOTE: logits is a pointer to the model's actual score array. Scaling and
+ * softmax therefore overwrite that array in place. This is safe in generation
+ * because the next pt_forward() call calculates a fresh set of logits.
+ */
 int pt_sample(pt_sampler_t *s, float *logits) {
     int n = s->vocab_size;
 
@@ -265,7 +421,12 @@ int pt_sample(pt_sampler_t *s, float *logits) {
 
     float coin = rng_float(&s->rng_state);
 
-    /* top-p (nucleus) sampling */
+    /*
+     * Discard candidates too small to affect a valid nucleus, sort the rest by
+     * probability, and walk from the largest downward until their running total
+     * crosses topp. The later running total performs the random choice within
+     * that retained group.
+     */
     if (s->topp > 0.0f && s->topp < 1.0f) {
         int n0 = 0;
         float cutoff = (1.0f - s->topp) / (float)(n - 1);
@@ -298,7 +459,7 @@ int pt_sample(pt_sampler_t *s, float *logits) {
         }
     }
 
-    /* sample from full distribution */
+    /* No active top-p group: use the same running-total method over all IDs. */
     float cdf = 0.0f;
     for (int i = 0; i < n; i++) {
         cdf += logits[i];
@@ -311,6 +472,27 @@ int pt_sample(pt_sampler_t *s, float *logits) {
  *  GENERATION LOOP
  * ═══════════════════════════════════════════════════════════════════ */
 
+/*
+ * FLOW: This is the text layer's main coordinator, called once per prompt:
+ *
+ *   encode prompt -> clear old sequence history -> loop over positions
+ *                 -> prefill known prompt IDs -> sample new IDs
+ *                 -> decode and print each new piece -> report timing
+ *
+ * LLM NOTE: pt_forward() accepts the current token and fills s->logits with
+ * scores for the following token. During prefill, the following token is
+ * already known from the user's prompt, so the loop feeds that real ID instead
+ * of sampling the model's guess. After the final prompt token is processed,
+ * decode begins: the sampler chooses each new ID, and that ID becomes the next
+ * iteration's input.
+ *
+ * max_tokens bounds total forward-loop positions rather than directly counting
+ * printed tokens; prompt prefill uses part of that budget. cfg->seq_len is the
+ * model's absolute position limit.
+ *
+ * CAUTION: prompt_tokens has 512 entries and pt_encode() has no capacity
+ * parameter. Project callers deliberately keep prompts within that assumption.
+ */
 void pt_generate(const pt_config_t *cfg, const pt_weights_t *w, pt_state_t *s,
                  pt_tokenizer_t *tok, pt_sampler_t *sampler,
                  const char *prompt, int max_tokens, pt_matvec_fn matvec) {
@@ -318,10 +500,15 @@ void pt_generate(const pt_config_t *cfg, const pt_weights_t *w, pt_state_t *s,
     int n_prompt;
     pt_encode(tok, prompt, /*bos=*/1, /*eos=*/0, prompt_tokens, &n_prompt);
 
+    /* The allocated KV cache has room for only cfg->seq_len positions. */
     if (max_tokens > cfg->seq_len)
         max_tokens = cfg->seq_len;
 
-    /* zero KV cache */
+    /*
+     * LLM NOTE: Start an independent sequence by erasing attention keys and
+     * values retained from the preceding prompt. These cache arrays avoid
+     * recomputing earlier positions while generating within the new sequence.
+     */
     int head_dim = cfg->dim / cfg->n_heads;
     int kv_dim   = cfg->n_kv_heads * head_dim;
     unsigned kv_bytes = (unsigned)cfg->n_layers * cfg->seq_len
@@ -335,6 +522,7 @@ void pt_generate(const pt_config_t *cfg, const pt_weights_t *w, pt_state_t *s,
     int n_decode = 0;
     uint32_t prefill_us = 0, decode_us = 0;
 
+    /* Each iteration processes `token` at `pos` and predicts what follows it. */
     for (int pos = 0; pos < max_tokens; pos++) {
         uint32_t t0 = timer_get_usec();
         pt_forward(cfg, w, s, token, pos, matvec);
@@ -342,17 +530,19 @@ void pt_generate(const pt_config_t *cfg, const pt_weights_t *w, pt_state_t *s,
 
         int next;
         if (pos < n_prompt - 1) {
-            /* prefill: force next prompt token */
+            /* Prefill: use the known next prompt ID; do not print or sample it. */
             next = prompt_tokens[pos + 1];
             prefill_us += elapsed;
         } else {
-            /* decode: sample */
+            /* Decode: choose a model-generated ID from the new logits. */
             next = pt_sample(sampler, s->logits);
             decode_us += elapsed;
             n_decode++;
 
+            /* BOS and EOS are control tokens, so stop without printing them. */
             if (next == 1 || next == 2) break;  /* BOS or EOS */
 
+            /* Stream one borrowed piece now; no complete response is stored. */
             const char *piece = pt_decode(tok, token, next);
             printk("%s", piece);
         }
@@ -362,7 +552,12 @@ void pt_generate(const pt_config_t *cfg, const pt_weights_t *w, pt_state_t *s,
 
     printk("\n");
 
-    /* timing summary */
+    /*
+     * HARDWARE NOTE: Accumulate time spent processing known prompt transitions
+     * separately from model-chosen output tokens. The final division reports
+     * decode throughput in tokens per second with one decimal digit. The host
+     * timer stub returns zero, so these measurements are Pi-oriented.
+     */
     unsigned total_tok = (unsigned)(n_prompt - 1) + (unsigned)n_decode;
     printk("[%d tokens | prefill %d.%ds",
            total_tok,
